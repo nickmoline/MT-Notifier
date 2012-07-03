@@ -2,16 +2,11 @@
 # A Movable Type plugin with subscription options for your installation
 # Copyright 2003-2010 Everitz Consulting <everitz.com>.
 #
-# This program is free software:  You may redistribute it and/or modify it
-# it under the terms of the Artistic License version 2 as published by the
-# Open Source Initiative.
-#
 # This program is distributed in the hope that it will be useful but does
 # NOT INCLUDE ANY WARRANTY; Without even the implied warranty of FITNESS
 # FOR A PARTICULAR PURPOSE.
 #
-# You should have received a copy of the Artistic License with this program.
-# If not, see <http://www.opensource.org/licenses/artistic-license-2.0.php>.
+# This program may not be redistributed without permission.
 # ===========================================================================
 package Notifier::Plugin;
 
@@ -361,6 +356,268 @@ sub write_history {
 
 # user interaction
 
+sub build_sub_table {
+    my $app = shift;
+    my (%args) = @_;
+    require MT::App::CMS;
+    require MT::Blog;
+    require MT::Util;
+    my $app_author = $app->user;
+    my $type       = $args{type};
+    my $class      = $app->model($type);
+    my $list_pref  = $app->list_pref($type);
+
+    my $iter;
+    if ($args{load_args}) {
+        $iter = $class->load_iter( @{ $args{load_args} } );
+    } elsif ($args{iter}) {
+        $iter = $args{iter};
+    } elsif ($args{items}) {
+        $iter = sub { shift @{ $args{items} } };
+    }
+    return [] unless ($iter);
+
+    my $limit = $args{limit};
+    my $param = $args{param} || {};
+
+    my @data;
+    my $blog;
+    while (my $obj = $iter->()) {
+        my $row = $obj->get_values;
+        if ($obj->blog_id) {
+            $blog = MT::Blog->load($obj->blog_id);
+        }
+        if ($obj->category_id) {
+            $row->{category_record} = 1;
+            require MT::Category;
+            my $category = MT::Category->load($obj->category_id);
+            if ($category) {
+                if ($blog) {
+                    my $link = $blog->archive_url;
+                    $link .= '/' unless ($link =~ m/\/$/);
+                    $link .= MT::Util::archive_file_for ('',  $blog, 'Category', $category);
+                    $row->{url_target} = $link;
+                }
+            }
+        } elsif ($obj->entry_id) {
+            $row->{entry_record} = 1;
+            require MT::Entry;
+            my $entry = MT::Entry->load($obj->entry_id);
+            $row->{url_target} = $entry->permalink if ($entry);
+        } elsif ($obj->blog_id) {
+            $row->{blog_record} = 1;
+            $row->{url_target} = $blog->site_url if ($blog);
+        }
+        $row->{url_block} = !$obj->record;
+        $row->{visible} = $obj->status;
+        if ((my $ts = $obj->modified_on) && $blog) {
+            my ($date_format, $datetime_format);
+            $date_format     = MT::App::CMS::LISTING_DATE_FORMAT();
+            $datetime_format = MT::App::CMS::LISTING_DATETIME_FORMAT();
+            $row->{created_on_formatted} =
+              MT::Util::format_ts( $date_format, $ts, $blog, $app->user ? $app->user->preferred_language : undef );
+            $row->{created_on_time_formatted} =
+              MT::Util::format_ts( $datetime_format, $ts, $blog, $app->user ? $app->user->preferred_language : undef );
+            $row->{created_on_relative} =
+              MT::Util::relative_date( $ts, time, $blog );
+        } else {
+            my $plugin = MT::Plugin::Notifier->instance;
+            $row->{created_on_formatted} = $plugin->translate('Unknown');
+            $row->{created_on_time_formatted} = $plugin->translate('Unknown');
+            $row->{created_on_relative} = $plugin->translate('Unknown');
+        }
+        $row->{object} = $obj;
+        push @data, $row;
+    }
+    return [] unless (@data);
+
+    $param->{sub_table}[0] = {%$list_pref};
+    $param->{object_loop} = $param->{sub_table}[0]{object_loop} = \@data;
+    $app->load_list_actions($type, \%$param);
+    \@data;
+}
+
+sub list_subs {
+    my $app = shift;
+    my ($param) = @_;
+    $param ||= {};
+
+    require Notifier::Data;
+    my $plugin = MT->component('Notifier');
+    my $type = $app->param('type') || Notifier::Data->class_type;
+    my $pkg = $app->model($type) or return $plugin->translate('Invalid Request');
+
+    # check permissions to data
+    my $q = $app->param;
+    my $perms = $app->permissions;
+    unless ($app->user->is_superuser) {
+        if ($app->param('blog_id')) {
+            return $app->errtrans('Permission denied.')
+                unless ($perms && $perms->can_edit_notifications());
+        } else {
+            require MT::Permission;
+            my @blogs =
+                map { $_->blog_id }
+                grep { $_->can_edit_notifications }
+                MT::Permission->load( { author_id => $app->user->id } );
+            return $app->errtrans('Permission denied.') unless (@blogs);
+        }
+    }
+
+    my $list_pref = $app->list_pref($type);
+    my %param = %$list_pref;
+    my $blog_id = $q->param('blog_id');
+
+    my %terms;
+    $terms{blog_id} = $blog_id if $blog_id;
+    $terms{class} = $type;
+    my $limit = $list_pref->{rows};
+    my $offset = $app->param('offset') || 0;
+
+    # load blog(s?)
+    if ( !$blog_id && !$app->user->is_superuser ) {
+        require MT::Permission;
+        $terms{blog_id} = [
+            map { $_->blog_id }
+              grep { $_->can_edit_notifications }
+              MT::Permission->load( { author_id => $app->user->id } )
+        ];
+    }
+
+    my %arg;
+    $arg{'sort'} = 'modified_on';
+    $arg{direction} = 'descend';
+
+    my $filter_col = $q->param('filter')     || '';
+    my $filter_key = $q->param('filter_key') || '';
+    my $filter_val = $q->param('filter_val');
+    my $total;
+
+    # look for user cipher, load by email if present (for individual user subs)
+    #my $cipher = $q->param('c') || '';
+    #if ($cipher) {
+    #    my $sub = Notifier::Data->load({ cipher => $cipher });
+    #    $terms{email} = $sub->email if (ref $sub);
+    #}
+
+    if ($filter_key) {
+        my $filters = $app->registry('list_filters', 'subscription') || {};
+        if (my $filter = $filters->{$filter_key}) {
+            if (my $code = $filter->{code} || $app->handler_to_coderef($filter->{handler})) {
+                $param{filter_key} = $filter_key;
+                $param{filter_label} = $filter->{label};
+                $code->(\%terms, \%arg);
+            }
+        }
+    } elsif ($filter_col eq 'status') {
+        if ($filter_val eq 'active') {
+            $param{filter_label} = 'Active';
+            $terms{record} = 1;
+            $terms{status} = 1;
+        }
+        if ($filter_val eq 'blocked') {
+            $param{filter_label} = 'Blocked';
+            $terms{record} = 0;
+            $terms{status} = 1;
+        }
+        if ($filter_val eq 'pending') {
+            $param{filter_label} = 'Pending';
+            $terms{status} = 0;
+        }
+        $param{filter_key} = $filter_val;
+        $param{filter_label} = $plugin->translate($param{filter_label}).' '.$pkg->class_label_plural;
+    }
+
+    $total = $pkg->count(\%terms, \%arg) || 0 unless (defined $total);
+    $arg{limit} = $limit + 1;
+    if ($total <= $limit) {
+        delete $arg{limit};
+        $offset = 0;
+    } elsif ($total && $offset > $total - 1) {
+        $arg{offset} = $offset = $total - $limit;
+    } elsif ($offset && (($offset < 0) || ($total - $offset < $limit))) {
+        $arg{offset} = $offset = $total - $limit;
+    } else {
+        $arg{offset} = $offset if ($offset);
+    }
+
+    my $iter = $pkg->load_iter(\%terms, \%arg);
+
+    my $data = build_sub_table($app,
+        iter    => $iter,
+        type    => $type,
+        param   => \%param,
+    );
+
+    delete $_->{object} foreach @$data;
+    delete $param{sub_table} unless (@$data);
+
+    ## We tried to load $limit + 1 entries above; if we actually got
+    ## $limit + 1 back, we know we have another page of entries.
+    my $have_next_sub = @$data > $limit;
+    pop @$data while @$data > $limit;
+    if ($offset) {
+        $param{prev_offset}     = 1;
+        $param{prev_offset_val} = $offset - $limit;
+        $param{prev_offset_val} = 0 if $param{prev_offset_val} < 0;
+    }
+    if ($have_next_sub) {
+        $param{next_offset}     = 1;
+        $param{next_offset_val} = $offset + $limit;
+    }
+
+    # $param{list_noncron}        = 0;
+    # $param{has_expanded_mode}   = 1;
+    $param{page_actions} = $app->page_actions($app->mode);
+    $param{list_filters} = $app->list_filters($type);
+    $param{saved_deleted} = $q->param('saved_deleted');
+    $param{saved} = $q->param('saved');
+    $param{limit} = $limit;
+    $param{offset} = $offset;
+    $param{object_type} = $type;
+    $param{object_label} = $pkg->class_label;
+    $param{object_label_plural} = $param{search_label} =
+      $pkg->class_label_plural;
+    $param{list_start} = $offset + 1;
+    $param{list_end} = $offset + scalar @$data;
+    $param{list_total} = $total;
+    $param{next_max} = $param{list_total} - $limit;
+    $param{next_max} = 0 if ( $param{next_max} || 0 ) < $offset + 1;
+    $param{nav_entries} = 1;
+    $param{feed_label} = $plugin->translate('[_1] Feed', $pkg->class_label);
+    $param{feed_url} =
+      $app->make_feed_link( $type, $blog_id ? { blog_id => $blog_id } : undef );
+    $app->add_breadcrumb($pkg->class_label_plural);
+    $param{listing_screen} = 1;
+
+    unless ($blog_id) {
+        $param{system_overview_nav} = 1;
+    }
+
+    # used for folders and pages - maybe use for users/subscriptions one day?
+    # $param{container_label} = $pkg->container_label;
+
+    unless ($param{screen_class}) {
+        # to piggyback on list-entry and list-notification styles
+        # - adds delete button, action bar (list-entry)
+        # - hides inline subscription form (list-notification)
+        $param{screen_class} = "list-$type list-entry list-notification";
+    }
+    $param{search_label} = $pkg->class_label_plural;
+
+    $param{mode} = $app->mode;
+    if (my $blog = MT::Blog->load($blog_id)) {
+        $param{sitepath_unconfigured} = $blog->site_path ? 0 : 1;
+    }
+
+    $param->{return_args} ||= $app->make_return_args;
+    my @return_args = grep { $_ !~ /offset=\d/ } split /&/, $param->{return_args};
+    $param{return_args} = join '&', @return_args;
+    $param{return_args} .= "&offset=$offset" if $offset;
+    $param{screen_id} = "list-entry";
+    $app->load_tmpl("list_subscription.tmpl", \%param);
+}
+
 sub notifier_count {
     my $app = shift;
     require Notifier::Data;
@@ -589,6 +846,41 @@ sub notify_entry {
     my $notify = $r->cache('mtn_notify_entry');
     return unless ($notify);
     Notifier::entry_notifications($notify);
+}
+
+sub notify_entry_cms_post_save {
+    my ( $eh, $app, $entry ) = @_;
+    my $blog_id = $entry->blog_id;
+	
+	if ($entry->status == MT::Entry::RELEASE()) {
+		require Notifier;
+		Notifier::entry_notifications($entry->id);
+	}	
+}
+
+sub notify_entry_post_publish {
+    my ( $eh, $app, $entry ) = @_;
+    my $blog_id = $entry->blog_id;
+	
+	if ($entry->status == MT::Entry::RELEASE()) {
+		require Notifier;
+		Notifier::entry_notifications($entry->id);
+	}	
+}
+
+sub output_search_replace {
+  my ($cb, $app, $template) = @_;
+  my $plugin = $cb->plugin;
+  my ($chk, $new, $old);
+
+  $chk = qq{<input type="hidden" name="_type" value="subscription" />};
+  $chk = quotemeta($chk);
+  return unless ($$template =~ m/$chk/);
+
+  $old = qq{<input type="hidden" name="quicksearch" value="1" />};
+  $old = quotemeta($old);
+  $new = qq{<input type="hidden" name="quicksearch" value="0" />};
+  $$template =~ s/$old/$new/;
 }
 
 # template tags

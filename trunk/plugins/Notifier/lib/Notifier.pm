@@ -2,16 +2,11 @@
 # A Movable Type plugin with subscription options for your installation
 # Copyright 2003-2010 Everitz Consulting <everitz.com>.
 #
-# This program is free software:  You may redistribute it and/or modify it
-# it under the terms of the Artistic License version 2 as published by the
-# Open Source Initiative.
-#
 # This program is distributed in the hope that it will be useful but does
 # NOT INCLUDE ANY WARRANTY; Without even the implied warranty of FITNESS
 # FOR A PARTICULAR PURPOSE.
 #
-# You should have received a copy of the Artistic License with this program.
-# If not, see <http://www.opensource.org/licenses/artistic-license-2.0.php>.
+# This program may not be redistributed without permission.
 # ===========================================================================
 package Notifier;
 
@@ -128,6 +123,7 @@ sub data_confirmation {
     my %head = (
         'From' => $sender_address,
         'To' => $data->email,
+	'Content-Type' => 'text/html',
     );
     my %param = (
         'notifier_record_cipher' => $data->cipher,
@@ -190,7 +186,17 @@ sub entry_notifications {
     require MT::Entry;
     require MT::Placement;
     require Notifier::Data;
+    require MT::Log;
+    use YAML qw(Dump Bless);
+
     my $entry = MT::Entry->load($entry_id);
+    MT->log({
+    	message => "Notifier Start. Entry: ".$entry->isa('MT::Entry'),
+    	metadata => $entry_id,
+    	class => "entry",
+    	blog_id => $entry->blog_id,
+    	level => MT::Log::DEBUG()
+    });
     return unless ((ref $entry) && $entry->isa('MT::Entry'));
     my %terms = (
         'blog_id' => $entry->blog_id,
@@ -199,20 +205,64 @@ sub entry_notifications {
         'record' => Notifier::Data::SUBSCRIBE(),
         'status' => Notifier::Data::RUNNING(),
     );
-    my @work_subs = Notifier::Data->load(\%terms);
+
+	my @second_subs = Notifier::Data->load(\%terms);
+
+    my $skip_blog_update = 0;
+
+    my @work_subs;
+
     my @places = MT::Placement->load({
-        blog_id => $entry->blog_id,
+        #blog_id => $entry->blog_id,
         entry_id => $entry->id,
     });
+
+	my $msg = 'Checking Cats: START LOOP: ';
+	my $i = 0;
+
     foreach my $place (@places) {
         my $cat = MT::Category->load($place->category_id);
+
+        $i++;
+
         next unless ((ref $cat) && $cat->isa('MT::Category'));
         $terms{'category_id'} = $cat->id;
+
+        $msg .= $i.': '.$cat->id.': '.$cat->label;
+        if ($cat->label =~ m/^(Events|Direct to Topics)$/msi) {
+    		$skip_blog_update = 1;
+    		$msg .= ' M! ';
+    	} else {
+    		$msg .= " D! ";
+    	}
         my @category_subs = Notifier::Data->load(\%terms);
         foreach (@category_subs) {
             push @work_subs, $_;
         }
     }
+	$msg .= 'END LOOP: '.$i;
+
+	if ($skip_blog_update == 1) {
+		$msg .= ' SKIPPING ENTRY NOTIFICATION!';
+	} else {
+		$msg .= ' SENDING ENTRY NOTIFICATION!';
+	}
+
+    MT->log({
+		message => $msg,
+		metadata => $entry->id,
+		class => 'entry',
+		blog_id => $entry->blog_id,
+		level => MT::Log::DEBUG()
+	});
+
+    
+    if ($skip_blog_update == 0) {
+    	if (scalar @second_subs) {
+    		notify_users($entry, \@second_subs);
+    	}
+    }
+
     return unless (scalar @work_subs);
     notify_users($entry, \@work_subs);
 }
@@ -276,6 +326,7 @@ sub notify_users {
     return unless ($sender_address);
     my %head = (
         'From' => $sender_address,
+		'Content-Type' => 'text/html',
     );
     # load notification subject template
     my %parms = (
@@ -335,7 +386,10 @@ sub notify_users {
             $tmpl->param(\%param);
             my $html = $tmpl->output();
             $html = $tmpl->errstr unless (defined $tmpl);
-            $body = $html;
+          
+          	use Text::Format;
+          
+            $body = Text::Format->new({columns => 78})->format($html);;
         }
         if ($system_queued && $blog_queued) {
             require Notifier::Queue;

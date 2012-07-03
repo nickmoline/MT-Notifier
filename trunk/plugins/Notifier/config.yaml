@@ -2,16 +2,12 @@
 # A Movable Type plugin with subscription options for your installation
 # Copyright 2003-2010 Everitz Consulting <everitz.com>.
 #
-# This program is free software:  You may redistribute it and/or modify it
-# it under the terms of the Artistic License version 2 as published by the
-# Open Source Initiative.
-#
 # This program is distributed in the hope that it will be useful but does
 # NOT INCLUDE ANY WARRANTY; Without even the implied warranty of FITNESS
 # FOR A PARTICULAR PURPOSE.
 #
-# You should have received a copy of the Artistic License with this program.
-# If not, see <http://www.opensource.org/licenses/artistic-license-2.0.php>.
+# This program may not be redistributed without permission.
+# MT::Entry::post_save: $Notifier::Notifier::Plugin::notify_entry
 # ===========================================================================
 name: MT-Notifier
 id: Notifier
@@ -81,10 +77,18 @@ init_app: $Notifier::Notifier::init_app
 
 applications:
     cms:
+        menus:
+            manage:notifier:
+                label: Subscriptions
+                order: 12000
+                mode: list_subs
+                view: blog
+                condition: $Notifier::Notifier::Util::check_permission
         methods:
             block_subs: $Notifier::Notifier::Plugin::block_subs
             clear_subs: $Notifier::Notifier::Plugin::clear_subs
             create_subs: $Notifier::Notifier::Plugin::create_subs
+            list_subs: $Notifier::Notifier::Plugin::list_subs
             sub_widget_blog: $Notifier::Notifier::Plugin::sub_widget_blog
             sub_widget_category: $Notifier::Notifier::Plugin::sub_widget_category
             sub_widget_entry: $Notifier::Notifier::Plugin::sub_widget_entry
@@ -92,10 +96,32 @@ applications:
         methods:
             verify_subs: $Notifier::Notifier::Plugin::verify_subs
 callbacks:
+    init_request: $Notifier::Notifier::Plugin::init_request
     MT::Comment::pre_save: $Notifier::Notifier::Plugin::check_comment
     MT::Comment::post_save: $Notifier::Notifier::Plugin::notify_comment
     MT::Entry::pre_save: $Notifier::Notifier::Plugin::check_entry
-    MT::Entry::post_save: $Notifier::Notifier::Plugin::notify_entry
+    MT::App::CMS::cms_post_save.entry: $Notifier::Notifier::Plugin::notify_entry_cms_post_save
+    MT::WeblogPublisher::scheduled_post_published: $Notifier::Notifier::Plugin::notify_entry_post_publish
+    MT::App::CMS::template_output.list_subscription: $Notifier::Notifier::Plugin::output_search_replace
+    MT::App::CMS::template_output.search_replace: $Notifier::Notifier::Plugin::output_search_replace
+default_templates:
+    base_path: templates/global
+    global:email:
+        notifier_comment_notification_body:
+            label: Comment Notification Body
+        notifier_comment_notification_subject:
+            label: Comment Notification Subject
+        notifier_confirmation_body:
+            label: Confirmation Body
+        notifier_confirmation_subject:
+            label: Confirmation Subject
+        notifier_entry_notification_body:
+            label: Entry Notification Body
+        notifier_entry_notification_subject:
+            label: Entry Notification Subject
+    global:system:
+        notifier_request:
+            label: Subscription Response
 list_actions:
     blog:
         mtn_add_subscription:
@@ -163,10 +189,40 @@ list_actions:
             label: <__trans phrase="Verify Subscription(s)">
             order: 1200
             code: $Notifier::Notifier::Plugin::verify_subs
+list_filters:
+    subscription:
+        active:
+            label: <__trans phrase="Active Subscriptions">
+            order: 100
+            handler: sub { my ($terms, $args) = @_; $terms->{record} = 1; $terms->{status} = 1; }
+        blocked:
+            label: <__trans phrase="Blocked Subscriptions">
+            order: 200
+            handler: sub { my ($terms, $args) = @_; $terms->{record} = 0; $terms->{status} = 1; }
+        pending:
+            label: <__trans phrase="Pending Subscriptions">
+            order: 300
+            handler: sub { my ($terms, $args) = @_; $terms->{status} = 0; }
 object_types:
     subscription: Notifier::Data
     subscription.history: Notifier::History
     subscription.queue: Notifier::Queue
+search_apis:
+    subscription:
+        order: 1000
+        permission: edit_notifications
+        handler: $Notifier::Notifier::Plugin::build_sub_table
+        label: Subscriptions
+        perm_check: sub { 1; }
+        search_cols:
+             email: sub { $plugin->translate('Email'); },
+             ip:  sub { $plugin->translate('IP Address'); },
+        replace_cols:
+            - email
+        can_replace: 1
+        view: blog
+        setup_terms_args: sub { my ($terms, $args, $blog_id) = @_; $args->{sort} = 'modified_on'; $args->{direction} = 'descend'; }
+        results_table_template: <mt:Include name="include/subscription_table.tmpl" component="notifier">
 tags:
     function:
         NotifierCatID: $Notifier::Notifier::Plugin::notifier_category_id
